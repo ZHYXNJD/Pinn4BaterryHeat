@@ -112,6 +112,13 @@ class ModelConfig:
 
 
 @dataclasses.dataclass
+class VisualizationConfig:
+    """Visualization options for evaluation heatmaps."""
+    x_slices_mm: List[float] = dataclasses.field(default_factory=lambda: [33.0, 132.0, 264.0, 396.0])
+    heatmap_time_points: List[float] = dataclasses.field(default_factory=lambda: [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0])
+
+
+@dataclasses.dataclass
 class OptimConfig:
     lr: float = 1e-3
     epochs: int = 2000
@@ -125,8 +132,10 @@ class OptimConfig:
     lr_patience: int = 0  # epochs without improvement before lr decay (0 disables scheduler)
     lr_decay: float = 0.5  # decay factor for scheduler
     lr_min: float = 0.0  # minimum lr for scheduler
-    # 每个 epoch 的最大 step 数，用于限制计算量；None 表示自动由数据集长度决定
+    # 每个 epoch 的最大 step 数，用于限制计算量；None 表示每 epoch 仅 1 step（原始行为）
     max_steps_per_epoch: Optional[int] = None
+    # 自适应 loss 权重：根据各 loss 分量的 EMA 归一化，避免单一分量主导
+    adaptive_loss_weights: bool = False
 
 
 @dataclasses.dataclass
@@ -139,6 +148,7 @@ class Config:
     model: ModelConfig
     optim: OptimConfig
     conditions: List[ConditionConfig]
+    visualization: VisualizationConfig = dataclasses.field(default_factory=VisualizationConfig)
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -148,6 +158,11 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 def _as_dataclass(cls, data: Dict[str, Any]):
     return cls(**data)
+
+
+def config_to_dict(cfg: Config) -> dict:
+    """Convert Config to a JSON-serializable dictionary."""
+    return dataclasses.asdict(cfg)
 
 
 def load_config(path: str) -> Config:
@@ -165,6 +180,8 @@ def load_config(path: str) -> Config:
     ]
     if not conditions:
         raise ValueError("At least one condition must be provided in the config.")
+    vis_raw = raw.get("visualization", {})
+    visualization = _as_dataclass(VisualizationConfig, vis_raw) if vis_raw else VisualizationConfig()
     return Config(
         geometry=geometry,
         physics=physics,
@@ -174,4 +191,5 @@ def load_config(path: str) -> Config:
         model=model,
         optim=optim,
         conditions=conditions,
+        visualization=visualization,
     )

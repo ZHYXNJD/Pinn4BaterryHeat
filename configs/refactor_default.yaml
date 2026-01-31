@@ -112,6 +112,11 @@ optim:
   lr_min: 1.0e-5
   max_steps_per_epoch: 100
 
+# 评估热力图截面配置 (x 位置 mm, 时间点 s)
+visualization:
+  x_slices_mm: [33.0, 132.0, 264.0, 396.0]   # 多个 x 截面位置
+  heatmap_time_points: [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0]
+
 # 工况条件
 conditions:
   - name: base_0p5C

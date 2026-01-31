@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
+from itertools import cycle
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from .config import Config, ConditionConfig
 from .geometry import BoxGeometry
@@ -59,9 +63,28 @@ class ConditionRuntime:
 
 
 class PINNTrainer:
-    def __init__(self, cfg: Config, device: str = "cpu", output_dir: str = "plots"):
+    def __init__(
+        self,
+        cfg: Config,
+        device: str = "cpu",
+        output_dir: str = "output",
+        checkpoint_dir: str = None,
+        test_results_dir: str = None,
+        config_name: str = "",
+    ):
         self.cfg = cfg
+        self.config_name = config_name or "default"
         self.device = torch.device(device)
+        self.output_dir = Path(output_dir)
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else self.output_dir / "checkpoints"
+        self.test_results_dir = Path(test_results_dir) if test_results_dir else self.output_dir / "test_results"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.test_results_dir.mkdir(parents=True, exist_ok=True)
+
+        plots_dir = self.output_dir / "plots"
+        runs_dir = self.output_dir / "runs"
+        log_dir = runs_dir / f"PINN_{self.config_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        runs_dir.mkdir(parents=True, exist_ok=True)
         gx = cfg.geometry.length_x_mm * max(cfg.geometry.cells_x, 1) / 1000.0
         gy = cfg.geometry.length_y_mm * max(cfg.geometry.cells_y, 1) / 1000.0
         gz = cfg.geometry.length_z_mm / 1000.0
@@ -96,7 +119,8 @@ class PINNTrainer:
         )
         self.interface_temp_scale = max(
             self._cfg_float(cfg.physics.interface_temp_scale, "physics.interface_temp_scale"), 1e-6)
-        self.visualizer = Visualizer(save_dir=output_dir)
+        self.visualizer = Visualizer(save_dir=str(plots_dir))
+        self.writer = SummaryWriter(log_dir=str(log_dir))
         self.plate_thickness = cfg.plate.thickness_mm / 1000.0
         self.plate_rho = cfg.plate.rho
         self.plate_cp = cfg.plate.cp
@@ -116,6 +140,7 @@ class PINNTrainer:
         self.channel_width = cfg.fluid.channel_width_mm / 1000.0 if cfg.fluid.channel_width_mm > 0 else 0.0
         self.channel_pitch = cfg.fluid.channel_pitch_mm / 1000.0 if cfg.fluid.channel_pitch_mm > 0 else 0.0
         self.channel_count = max(cfg.fluid.channel_count, 0)
+        # 这里有问题 1. 没有指定axis 2.忽略了channel width
         self.channel_centers = self.geometry.channel_centers(
             self.channel_axis, self.channel_count, self.channel_pitch, device=self.device
         )
@@ -129,9 +154,6 @@ class PINNTrainer:
         else:
             self.flow_dir = 2
             self.flow_vec = torch.tensor([0.0, 0.0, cfg.fluid.vel_m_s], device=self.device)
-        # AMP mixed precision scaler
-        self.scaler = torch.amp.GradScaler('cuda')
-        self.scheduler = None
         if self.cfg.optim.lr_patience > 0:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
@@ -139,6 +161,8 @@ class PINNTrainer:
                 patience=self.cfg.optim.lr_patience,
                 min_lr=self.cfg.optim.lr_min,
             )
+        else:
+            self.scheduler = None
         if cfg.physics.interface_flux_scale is not None:
             self.interface_flux_scale = max(
                 self._cfg_float(cfg.physics.interface_flux_scale, "physics.interface_flux_scale"), 1e-6
@@ -386,7 +410,7 @@ class PINNTrainer:
         temperature_target = y_batch.to(self.device).view(-1, 1)
         cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(temperature_target.shape[0], 1)
         T_net = self.model(norm_coords, cond_vec)
-        T = T_net + cond.inlet_temp
+        T = T_net + self.cfg.physics.init_temp
         return self.mse(T, temperature_target)
 
     def _residual_loss(self, cond: ConditionRuntime) -> torch.Tensor:
@@ -514,7 +538,8 @@ class PINNTrainer:
         laplace = d2Tdx2 + d2Tdy2 + d2Tdz2
 
         # Phase change support: use effective cp if enabled for plate region
-        if self.cfg.phase_change.enabled and self.cfg.phase_change.pcm_region == "plate":
+        # if self.cfg.phase_change.enabled and self.cfg.phase_change.pcm_region == "plate":
+        if self.cfg.phase_change.enabled:
             cp_eff = self._effective_cp(T, self.plate_cp)
             rho_cp = self.plate_rho * cp_eff
         else:
@@ -523,33 +548,19 @@ class PINNTrainer:
         base = (res ** 2).mean()
         return base + self.cfg.physics.smooth_weight * smooth_loss
 
-    # 由于采样点中包含边界点 这里需要修改采样逻辑
-    # 不再随机采样 而是直接加载boundary data
-    # 观测点的值作为label 计算loss
-    def _boundary_loss(self, cond: ConditionRuntime, x_batch: torch.Tensor, y_batch: torch.Tensor) -> torch.Tensor:
-        """使用边界数据计算边界损失。
-        
-        Args:
-            cond: 条件参数
-            x_batch: 边界点坐标 (batch_size, 4) - (x, y, z, t)
-            y_batch: 边界点观测温度 (batch_size,)
-        """
-        xyz_raw = x_batch[:, :3].to(self.device)
-        t_raw = x_batch[:, 3:4].to(self.device)
-        temperature_target = y_batch.to(self.device)
+    def _boundary_loss(self, cond: ConditionRuntime) -> torch.Tensor:
+        n = self.cfg.optim.batch_boundary
+        xyz, normals, faces = self.geometry.sample_boundary(n, self.device)
+        coords = torch.cat(
+            [xyz, torch.rand((n, 1), device=self.device) * self.cfg.physics.t_max],
+            dim=1,
+        )
+        coords = coords.clone().detach().requires_grad_(True)
+        xyz = coords[:, :3].clone()
+        t = coords[:, 3:4].clone()
 
-        # 判断每个点在哪个面上，并获取法向量
-        faces, normals = self._get_face_and_normal(xyz_raw)
-
-        # 构建坐标并计算梯度
-        coords = torch.cat([xyz_raw, t_raw], dim=1).clone().detach().requires_grad_(True)
-        # 3. 【关键修改】从 coords 中切分出 xyz 和 t
-        # 这样 T_net 才会依赖于 coords，autograd 才能计算 d(T)/d(coords)
-        xyz_grad = coords[:, :3]
-        t_grad = coords[:, 3:4]
-        cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(xyz_grad.shape[0], 1)
-        # 使用带有梯度的变量 xyz_grad, t_grad 进行归一化和前向传播
-        norm_coords = self._normalize(xyz_grad, t_grad)
+        cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(n, 1)
+        norm_coords = self._normalize(xyz, t)
         T_net = self.model(norm_coords, cond_vec)
         T = T_net + self.cfg.physics.init_temp
 
@@ -567,8 +578,7 @@ class PINNTrainer:
         # 使用观测温度作为参考温度，而不是固定的cond.t_env
         # Equivalent convection: k_n * dT/dn + h * (T - T_obs) = 0
         h_env = torch.full_like(dTdn, self.cfg.physics.h_env)
-        # 修复形状：确保 target 是 (N, 1) 而不是 (N,)
-        T_ref = temperature_target.view(-1, 1)
+        T_ref = torch.full_like(T, cond.t_env)
         cold_mask = (faces == self.cold_plate_face_idx).unsqueeze(-1)
 
         # Only apply convection on non-cold faces; cold face is handled by interface coupling loss.
@@ -612,7 +622,9 @@ class PINNTrainer:
         k_n = torch.full_like(dTdn, k_value)
         bc_res = k_n * dTdn + h_coeff * (T - T_ref)
         bc_scale = torch.clamp(h_coeff, min=1.0)
-        bc_res = bc_res / bc_scale / self.cold_bc_temp_scale
+        # bc_res = bc_res / bc_scale / self.cold_bc_temp_scale
+        # WHY THERE IS A h_coeff
+        bc_res = bc_res / bc_scale
         return (bc_res ** 2).mean()
 
     def _fluid_residual(self, cond: ConditionRuntime) -> torch.Tensor:
@@ -638,7 +650,7 @@ class PINNTrainer:
         cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(n, 1)
         norm_coords = self._normalize(xyz, t)
         T_net = self.model(norm_coords, cond_vec)
-        T = T_net + self.cfg.physics.init_temp
+        T = T_net + self.cfg.fluid.inlet_temp
 
         grads = torch.autograd.grad(
             outputs=T,
@@ -668,7 +680,8 @@ class PINNTrainer:
 
         v = self.flow_vec.to(coords)
         adv = v[0] * dTdx + v[1] * dTdy + v[2] * dTdz
-        if self.cfg.phase_change.enabled and self.cfg.phase_change.pcm_region == "battery":
+        # if self.cfg.phase_change.enabled and self.cfg.phase_change.pcm_region == "battery":
+        if self.cfg.phase_change.enabled:
             cp_eff = self._effective_cp(T, self.cfg.physics.cp)
         else:
             cp_eff = self.cfg.fluid.cp
@@ -768,7 +781,7 @@ class PINNTrainer:
         cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(n, 1)
         norm_coords = self._normalize(xyz, t)
         T_net = self.model(norm_coords, cond_vec)
-        T = T_net + self.cfg.physics.init_temp
+        T = T_net + self.cfg.fluid.inlet_temp
         target = torch.full_like(T, cond.inlet_temp)
         return self.mse(T, target)
 
@@ -814,26 +827,38 @@ class PINNTrainer:
         # 为每个工况构建一次性的 Dataset/DataLoader（如果配置了路径）
         batch_size = self.cfg.optim.batch_data
         interior_loaders: list[DataLoader | None] = []
-        boundary_loaders: list[DataLoader | None] = []
 
         print("Initializing Datasets from config (per-condition, no step loop)...")
         for i, cond in enumerate(self.conditions):
             has_interior = getattr(cond, "train_interior", None)
-            has_boundary = getattr(cond, "train_boundary", None)
 
             ld_int = None
-            ld_bnd = None
             if has_interior:
                 print(f"  - Condition {i} ({cond.name}): train_interior = {has_interior}")
                 ds_int = BatteryDataset(has_interior)
                 ld_int = DataLoader(ds_int, batch_size=batch_size, shuffle=True)
-            if has_boundary:
-                print(f"  - Condition {i} ({cond.name}): train_boundary = {has_boundary}")
-                ds_bnd = BatteryDataset(has_boundary)
-                ld_bnd = DataLoader(ds_bnd, batch_size=batch_size, shuffle=True)
 
             interior_loaders.append(ld_int)
-            boundary_loaders.append(ld_bnd)
+
+        steps_per_epoch = self.cfg.optim.max_steps_per_epoch if self.cfg.optim.max_steps_per_epoch is not None else 1
+        use_adaptive = getattr(self.cfg.optim, "adaptive_loss_weights", False)
+        if steps_per_epoch > 1 or use_adaptive:
+            print(f"  steps_per_epoch={steps_per_epoch}, adaptive_loss_weights={use_adaptive}")
+        ema_decay = 0.9
+        ema_eps = 1e-8
+        loss_ema = {
+            "data": 1.0,
+            "res": 1.0,
+            "bc": 1.0,
+            "cold_bc": 1.0,
+            "ic": 1.0,
+            "fluid_res": 1.0,
+            "fluid_inlet": 1.0,
+            "interface": 1.0,
+        }
+
+        best_loss = float("inf")
+        best_epoch = 0
 
         for epoch in range(1, self.cfg.optim.epochs + 1):
             epoch_loss = 0.0
@@ -846,120 +871,155 @@ class PINNTrainer:
             total_fluid_inlet = 0.0
             total_interface = 0.0
 
-            self.optimizer.zero_grad()
+            ld_iterators = [
+                cycle(ld) if ld is not None else None
+                for ld in interior_loaders
+            ]
 
-            bc_w = scheduled_weight(
-                self.cfg.physics.bc_weight,
-                epoch,
-                warmup=self.cfg.physics.bc_warmup_epochs,
-                freeze=0,
-            )
-            cold_bc_w = scheduled_weight(
-                self.cold_bc_weight,
-                epoch,
-                warmup=self.cfg.physics.cold_bc_warmup_epochs,
-                freeze=self.cfg.physics.cold_bc_freeze_epochs,
-            )
-            fluid_res_w = scheduled_weight(
-                self.cfg.physics.fluid_residual_weight,
-                epoch,
-                warmup=self.cfg.physics.fluid_residual_warmup_epochs,
-                freeze=self.cfg.physics.fluid_residual_freeze_epochs,
-            )
-            fluid_inlet_w = scheduled_weight(
-                self.cfg.physics.fluid_inlet_weight,
-                epoch,
-                warmup=self.cfg.physics.fluid_inlet_warmup_epochs,
-                freeze=self.cfg.physics.fluid_inlet_freeze_epochs,
-            )
-            interface_w = scheduled_weight(
-                self.cfg.physics.interface_weight,
-                epoch,
-                warmup=self.cfg.physics.interface_warmup_epochs,
-                freeze=self.cfg.physics.interface_freeze_epochs,
-            )
+            for step in range(steps_per_epoch):
+                self.optimizer.zero_grad()
 
-            for idx, cond in enumerate(self.conditions):
-                # 1) 可选的有监督 data loss（单个 batch，避免显存暴涨）
-                loss_data = torch.tensor(0.0, device=self.device)
-                loss_bc_data = torch.tensor(0.0, device=self.device)
-
-                ld_int = interior_loaders[idx]
-                if ld_int is not None:
-                    try:
-                        x_int, y_int = next(iter(ld_int))
-                        loss_data = self._data_loss(cond, x_int, y_int)
-                    except StopIteration:
-                        pass
-
-                ld_bnd = boundary_loaders[idx]
-                if ld_bnd is not None and epoch > self.cfg.physics.bc_freeze_epochs:
-                    try:
-                        x_bnd, y_bnd = next(iter(ld_bnd))
-                        loss_bc_data = self._boundary_loss(cond, x_bnd, y_bnd)
-                    except StopIteration:
-                        pass
-
-                # 2) PDE 残差与物理损失（原始结构）
-                res_loss = self._residual_loss(cond)
-                plate_res_loss = self._plate_residual(cond)
-                fluid_res_loss = self._fluid_residual(cond)
-                bc_loss = torch.tensor(0.0, device=self.device)
-                plate_bc_loss = torch.tensor(0.0, device=self.device)
-                if ld_bnd is None and epoch > self.cfg.physics.bc_freeze_epochs:
-                    # 仅当没有监督边界数据时，才使用物理边界损失
-                    bc_loss = torch.tensor(0.0, device=self.device)  # 保留接口以防后续需要恢复
-                if epoch > self.cfg.physics.cold_bc_freeze_epochs:
-                    plate_bc_loss = self._plate_boundary_loss(cond)
-                ic_loss = self._initial_loss(cond)
-                fluid_inlet_loss = self._fluid_inlet_loss(cond)
-                interface_loss = self._interface_loss(cond)
-
-                data_weight = getattr(self.cfg.physics, "data_weight", 1.0)
-
-                loss = (
-                    data_weight * loss_data
-                    + bc_w * loss_bc_data
-                    + self.cfg.physics.residual_weight * (res_loss + plate_res_loss)
-                    + fluid_res_w * fluid_res_loss
-                    + cold_bc_w * plate_bc_loss
-                    + self.cfg.physics.ic_weight * ic_loss
-                    + fluid_inlet_w * fluid_inlet_loss
-                    + interface_w * interface_loss
+                bc_w = scheduled_weight(
+                    self.cfg.physics.bc_weight,
+                    epoch,
+                    warmup=self.cfg.physics.bc_warmup_epochs,
+                    freeze=0,
+                )
+                cold_bc_w = scheduled_weight(
+                    self.cold_bc_weight,
+                    epoch,
+                    warmup=self.cfg.physics.cold_bc_warmup_epochs,
+                    freeze=self.cfg.physics.cold_bc_freeze_epochs,
+                )
+                fluid_res_w = scheduled_weight(
+                    self.cfg.physics.fluid_residual_weight,
+                    epoch,
+                    warmup=self.cfg.physics.fluid_residual_warmup_epochs,
+                    freeze=self.cfg.physics.fluid_residual_freeze_epochs,
+                )
+                fluid_inlet_w = scheduled_weight(
+                    self.cfg.physics.fluid_inlet_weight,
+                    epoch,
+                    warmup=self.cfg.physics.fluid_inlet_warmup_epochs,
+                    freeze=self.cfg.physics.fluid_inlet_freeze_epochs,
+                )
+                interface_w = scheduled_weight(
+                    self.cfg.physics.interface_weight,
+                    epoch,
+                    warmup=self.cfg.physics.interface_warmup_epochs,
+                    freeze=self.cfg.physics.interface_freeze_epochs,
                 )
 
-                loss.backward()
-                epoch_loss += loss.item()
-                total_data += loss_data.item()
-                total_res += res_loss.item() + plate_res_loss.item()
-                total_fluid_res += fluid_res_loss.item()
-                total_bc += loss_bc_data.item() + bc_loss.item()
-                total_cold_bc += plate_bc_loss.item()
-                total_ic += ic_loss.item()
-                total_fluid_inlet += fluid_inlet_loss.item()
-                total_interface += interface_loss.item()
+                for idx, cond in enumerate(self.conditions):
+                    loss_data = torch.tensor(0.0, device=self.device)
 
-            if self.cfg.optim.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optim.grad_clip)
-            self.optimizer.step()
 
-            avg_total = epoch_loss / num_conditions
-            avg_data = total_data / num_conditions
-            avg_res = total_res / num_conditions
-            avg_fluid_res = total_fluid_res / num_conditions
-            avg_bc = total_bc / num_conditions
-            avg_cold_bc = total_cold_bc / num_conditions
-            avg_ic = total_ic / num_conditions
-            avg_fluid_inlet = total_fluid_inlet / num_conditions
-            avg_interface = total_interface / num_conditions
+                    ld_iter = ld_iterators[idx]
+                    if ld_iter is not None:
+                        x_int, y_int = next(ld_iter)
+                        loss_data = self._data_loss(cond, x_int, y_int)
+                    res_loss = self._residual_loss(cond)
+                    plate_res_loss = self._plate_residual(cond)
+                    fluid_res_loss = self._fluid_residual(cond)
+                    bc_loss = self._boundary_loss(cond)
+                    plate_bc_loss = torch.tensor(0.0, device=self.device)
+                    if epoch > self.cfg.physics.cold_bc_freeze_epochs:
+                        plate_bc_loss = self._plate_boundary_loss(cond)
+                    ic_loss = self._initial_loss(cond)
+                    fluid_inlet_loss = self._fluid_inlet_loss(cond)
+                    interface_loss = self._interface_loss(cond)
+
+                    data_weight = getattr(self.cfg.physics, "data_weight", 1.0)
+                    res_val = (res_loss + plate_res_loss).item()
+                    bc_val = bc_loss.item()
+
+                    if use_adaptive:
+                        loss_ema["data"] = ema_decay * loss_ema["data"] + (1 - ema_decay) * loss_data.item()
+                        loss_ema["res"] = ema_decay * loss_ema["res"] + (1 - ema_decay) * res_val
+                        loss_ema["bc"] = ema_decay * loss_ema["bc"] + (1 - ema_decay) * bc_val
+                        loss_ema["cold_bc"] = ema_decay * loss_ema["cold_bc"] + (1 - ema_decay) * plate_bc_loss.item()
+                        loss_ema["ic"] = ema_decay * loss_ema["ic"] + (1 - ema_decay) * ic_loss.item()
+                        loss_ema["fluid_res"] = ema_decay * loss_ema["fluid_res"] + (1 - ema_decay) * fluid_res_loss.item()
+                        loss_ema["fluid_inlet"] = ema_decay * loss_ema["fluid_inlet"] + (1 - ema_decay) * fluid_inlet_loss.item()
+                        loss_ema["interface"] = ema_decay * loss_ema["interface"] + (1 - ema_decay) * interface_loss.item()
+                        scale_data = 1.0 / (loss_ema["data"] + ema_eps)
+                        scale_res = 1.0 / (loss_ema["res"] + ema_eps)
+                        scale_bc = 1.0 / (loss_ema["bc"] + ema_eps)
+                        scale_cold_bc = 1.0 / (loss_ema["cold_bc"] + ema_eps)
+                        scale_ic = 1.0 / (loss_ema["ic"] + ema_eps)
+                        scale_fluid_res = 1.0 / (loss_ema["fluid_res"] + ema_eps)
+                        scale_fluid_inlet = 1.0 / (loss_ema["fluid_inlet"] + ema_eps)
+                        scale_interface = 1.0 / (loss_ema["interface"] + ema_eps)
+                        loss = (
+                            data_weight * loss_data * scale_data
+                            + bc_w * bc_loss * scale_bc
+                            + self.cfg.physics.residual_weight * (res_loss + plate_res_loss) * scale_res
+                            + fluid_res_w * fluid_res_loss * scale_fluid_res
+                            + cold_bc_w * plate_bc_loss * scale_cold_bc
+                            + self.cfg.physics.ic_weight * ic_loss * scale_ic
+                            + fluid_inlet_w * fluid_inlet_loss * scale_fluid_inlet
+                            + interface_w * interface_loss * scale_interface
+                        )
+                    else:
+                        loss = (
+                            data_weight * loss_data
+                            + bc_w * bc_loss
+                            + self.cfg.physics.residual_weight * (res_loss + plate_res_loss)
+                            + fluid_res_w * fluid_res_loss
+                            + cold_bc_w * plate_bc_loss
+                            + self.cfg.physics.ic_weight * ic_loss
+                            + fluid_inlet_w * fluid_inlet_loss
+                            + interface_w * interface_loss
+                        )
+
+                    loss.backward()
+                    epoch_loss += loss.item()
+                    total_data += loss_data.item()
+                    total_res += res_val
+                    total_fluid_res += fluid_res_loss.item()
+                    total_bc += bc_val
+                    total_cold_bc += plate_bc_loss.item()
+                    total_ic += ic_loss.item()
+                    total_fluid_inlet += fluid_inlet_loss.item()
+                    total_interface += interface_loss.item()
+
+                if self.cfg.optim.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optim.grad_clip)
+                self.optimizer.step()
+
+            num_steps_total = steps_per_epoch * num_conditions
+            avg_total = epoch_loss / num_steps_total
+            avg_data = total_data / num_steps_total
+
+            if avg_total < best_loss:
+                best_loss = avg_total
+                best_epoch = epoch
+                best_path = self.checkpoint_dir / f"pinn_{self.config_name}_best.pt"
+                torch.save(
+                    {
+                        "model_state": self.model.state_dict(),
+                        "config": dataclasses.asdict(self.cfg),
+                        "epoch": epoch,
+                        "loss": avg_total,
+                    },
+                    best_path,
+                )
+                print(f"  -> Best model saved at epoch {epoch} (loss={avg_total:.4e})")
+            avg_res = total_res / num_steps_total
+            avg_fluid_res = total_fluid_res / num_steps_total
+            avg_bc = total_bc / num_steps_total
+            avg_cold_bc = total_cold_bc / num_steps_total
+            avg_ic = total_ic / num_steps_total
+            avg_fluid_inlet = total_fluid_inlet / num_steps_total
+            avg_interface = total_interface / num_steps_total
 
             if epoch % self.cfg.optim.print_every == 0:
                 print(
                     f"[{epoch:06d}] total_loss={avg_total:.4e} "
                     f"(data={avg_data:.3e}, "
-                    f"res={avg_res:.3e}, fluid_res={avg_fluid_res:.3e} "
-                    f"bc={avg_bc:.3e}, cold_bc={avg_cold_bc:.3e}"
-                    f"ic={avg_ic:.3e}"
+                    f"res={avg_res:.3e}, fluid_res={avg_fluid_res:.3e}, "
+                    f"bc={avg_bc:.3e}, "
+                    f"ic={avg_ic:.3e}, "
                     f"fluid_inlet={avg_fluid_inlet:.3e}, "
                     f"interface={avg_interface:.3e}"
                 )
@@ -978,18 +1038,25 @@ class PINNTrainer:
             if self.scheduler is not None:
                 self.scheduler.step(avg_total)
 
+            # TensorBoard: log metrics every epoch
+            self.writer.add_scalar("loss/total", avg_total, epoch)
+            self.writer.add_scalar("loss/data", avg_data, epoch)
+            self.writer.add_scalar("loss/residual", avg_res, epoch)
+            self.writer.add_scalar("loss/boundary", avg_bc + avg_cold_bc, epoch)
+            # self.writer.add_scalar("loss/cold_bc", avg_cold_bc, epoch)
+            self.writer.add_scalar("loss/initial", avg_ic, epoch)
+            self.writer.add_scalar("loss/fluid_residual", avg_fluid_res, epoch)
+            self.writer.add_scalar("loss/fluid_inlet", avg_fluid_inlet, epoch)
+            self.writer.add_scalar("loss/interface", avg_interface, epoch)
+            if self.scheduler is not None:
+                lr = self.optimizer.param_groups[0]["lr"]
+                self.writer.add_scalar("optim/learning_rate", lr, epoch)
+
             if epoch % self.cfg.optim.plot_every == 0:
                 self.visualizer.plot_loss(epoch)
-                self.visualizer.plot_temperature(
-                    self.model,
-                    self.geometry,
-                    self.device,
-                    epoch,
-                    self.conditions[0],
-                    self.cfg.physics.t_max,
-                    self.cfg.physics.init_temp,
-                    normalize_fn=self._normalize,
-                )
+
+        self.writer.close()
+        print(f"Training done. Best model: epoch {best_epoch} (loss={best_loss:.4e})")
 
     def save(self, path: str):
         torch.save(
@@ -1004,27 +1071,22 @@ class PINNTrainer:
         print("Starting final evaluation...")
         self.visualizer.plot_loss(self.cfg.optim.epochs)
 
-        for i, cond in enumerate(self.conditions):
-            print(f"Plotting final temperature for condition: {cond.name}")
-            self.visualizer.plot_temperature(
-                self.model,
-                self.geometry,
-                self.device,
-                self.cfg.optim.epochs,
-                cond,
-                self.cfg.physics.t_max,
-                self.cfg.physics.init_temp,
-                name_suffix="final",
-                normalize_fn=self._normalize,
-            )
-
     def evaluate_on_test(self):
         """Evaluate model on independent test CSVs configured per condition."""
         print("Evaluating on test datasets...")
         results = []
-        save_dir = getattr(self.visualizer, "save_dir", "plots")
-        save_dir = Path(save_dir)
+        save_dir = self.test_results_dir
         save_dir.mkdir(parents=True, exist_ok=True)
+
+        vis = getattr(self.cfg, "visualization", None)
+        if vis is not None:
+            x_positions_mm = list(vis.x_slices_mm) if hasattr(vis, "x_slices_mm") else [33.0]
+            time_points = list(vis.heatmap_time_points) if hasattr(vis, "heatmap_time_points") else [300.0, 600.0, 900.0, 1200.0, 1500.0, self.cfg.physics.t_max]
+            if self.cfg.physics.t_max not in time_points:
+                time_points.append(self.cfg.physics.t_max)
+        else:
+            x_positions_mm = [33.0]
+            time_points = [300.0, 600.0, 900.0, 1200.0, 1500.0, self.cfg.physics.t_max]
 
         for i, cond in enumerate(self.conditions):
             test_path = getattr(cond, "test", None)
@@ -1040,6 +1102,7 @@ class PINNTrainer:
 
             loader = DataLoader(ds_test, batch_size=self.cfg.optim.batch_data, shuffle=False)
             all_errors = []
+            all_rows = []
             with torch.no_grad():
                 for x_batch, y_batch in loader:
                     xyz = x_batch[:, :3].to(self.device)
@@ -1051,6 +1114,22 @@ class PINNTrainer:
                     target = y_batch.to(self.device).view(-1, 1)
                     rel_err = (T - target).abs() / (target.abs() + 1e-3)
                     all_errors.append(rel_err.detach().cpu().view(-1))
+
+                    x_mm = (xyz[:, 0].cpu().numpy() * 1000).astype(float)
+                    y_mm = (xyz[:, 1].cpu().numpy() * 1000).astype(float)
+                    z_mm = (xyz[:, 2].cpu().numpy() * 1000).astype(float)
+                    t_np = t.cpu().numpy().flatten().astype(float)
+                    true_np = target.cpu().numpy().flatten().astype(float)
+                    pred_np = T.cpu().numpy().flatten().astype(float)
+                    for j in range(len(t_np)):
+                        all_rows.append({
+                            "x_mm": x_mm[j],
+                            "y_mm": y_mm[j],
+                            "z_mm": z_mm[j],
+                            "t": t_np[j],
+                            "temperature_true": true_np[j],
+                            "temperature_pred": pred_np[j],
+                        })
 
             if not all_errors:
                 print(f"  - Condition {cond.name}: empty test loader, skipping.")
@@ -1074,8 +1153,63 @@ class PINNTrainer:
                 }
             )
 
+            # Save predictions and original data
+            pred_df = pd.DataFrame(all_rows)
+            pred_csv_path = save_dir / f"predictions_{cond.name}_{self.config_name}.csv"
+            pred_df.to_csv(pred_csv_path, index=False)
+            print(f"  - Saved predictions to {pred_csv_path}")
+
+            # Select 3 representative points: same x (closest to center), different z (-109, 0, 109)
+            unique_pts = pred_df[["x_mm", "y_mm", "z_mm"]].drop_duplicates()
+            point_coords = []
+            if len(unique_pts) >= 3:
+                x_vals = unique_pts["x_mm"].unique()
+                x_center = float(x_vals[np.argmin(np.abs(x_vals))])
+                z_vals = sorted(unique_pts["z_mm"].unique())
+                for z in (z_vals[:3] if len(z_vals) >= 3 else z_vals):
+                    row = unique_pts[
+                        (np.isclose(unique_pts["x_mm"], x_center))
+                        & (np.isclose(unique_pts["z_mm"], z))
+                    ]
+                    if not row.empty:
+                        r = row.iloc[0]
+                        point_coords.append((float(r["x_mm"]), float(r["y_mm"]), float(r["z_mm"])))
+                while len(point_coords) < 3 and len(unique_pts) > len(point_coords):
+                    for _, r in unique_pts.iterrows():
+                        pt = (float(r["x_mm"]), float(r["y_mm"]), float(r["z_mm"]))
+                        if pt not in point_coords:
+                            point_coords.append(pt)
+                            break
+                    else:
+                        break
+            if point_coords:
+                pred_plot_path = save_dir / f"pred_vs_true_{cond.name}_{self.config_name}.png"
+                self.visualizer.plot_prediction_vs_true(
+                    pred_df,
+                    point_coords[:3],
+                    cond.name,
+                    str(pred_plot_path),
+                    config_name=self.config_name,
+                )
+
+            # Plot yz cross-section heatmaps at x=33mm for each condition
+            print(f"  - Plotting heatmaps for condition: {cond.name}")
+            self.visualizer.plot_temperature_yz_slice(
+                self.model,
+                self.geometry,
+                self.device,
+                cond,
+                self.cfg.physics.t_max,
+                self.cfg.physics.init_temp,
+                x_positions_mm=x_positions_mm,
+                time_points=time_points,
+                normalize_fn=self._normalize,
+                save_dir=str(save_dir),
+                config_name=self.config_name,
+            )
+
         if results:
             df = pd.DataFrame(results)
-            metrics_path = save_dir / "test_metrics.csv"
+            metrics_path = save_dir / f"test_metrics_{self.config_name}.csv"
             df.to_csv(metrics_path, index=False)
             print(f"Saved test metrics to {metrics_path}")

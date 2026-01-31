@@ -2,9 +2,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 class Visualizer:
     def __init__(self, save_dir: str = "plots"):
@@ -181,3 +182,145 @@ class Visualizer:
         plt.savefig(self.save_dir / filename)
         plt.close(fig)
         print(f"Saved temperature plot to {self.save_dir / filename}")
+
+    def plot_temperature_yz_slice(
+        self,
+        model,
+        geometry,
+        device,
+        condition,
+        t_max_val: float,
+        init_temp: float,
+        x_positions_mm: List[float] = None,
+        time_points: List[float] = None,
+        normalize_fn=None,
+        save_dir=None,
+        config_name: str = "",
+    ):
+        """Plot yz-plane temperature heatmaps at fixed x positions for multiple time points.
+
+        Args:
+            x_positions_mm: list of x positions in mm for cross-sections, e.g. [33, 132, 264, 396]
+            time_points: list of times in seconds, e.g. [300, 600, 900, 1200, 1500, 1800]
+        """
+        if time_points is None:
+            time_points = [300.0, 600.0, 900.0, 1200.0, 1500.0, t_max_val]
+        if x_positions_mm is None:
+            x_positions_mm = [33.0]
+        x_list = [float(x) for x in x_positions_mm]
+
+        out_dir = Path(save_dir) if save_dir is not None else self.save_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        half_y = geometry.length_y / 2.0
+        half_z = geometry.length_z / 2.0
+
+
+        y = np.linspace(-half_y, half_y, 100)
+        z = np.linspace(-half_z, half_z, 100)
+        Y, Z = np.meshgrid(y, z)
+
+        N = Y.size
+        cond_vec = condition.vector().to(device).unsqueeze(0).repeat(N, 1)
+
+        model.eval()
+        with torch.no_grad():
+            for x_mm in x_list:
+                x_m = (x_mm / 1000.0) - (geometry.length_x / 2.0)
+
+                xyz = np.zeros((N, 3), dtype=np.float32)
+                xyz[:, 0] = x_m
+                xyz[:, 1] = Y.flatten()
+                xyz[:, 2] = Z.flatten()
+                xyz_tensor = torch.tensor(xyz, device=device)
+
+                for t_val in time_points:
+                    t_val = min(float(t_val), t_max_val)
+                    t = np.full((N, 1), t_val, dtype=np.float32)
+                    t_tensor = torch.tensor(t, device=device)
+
+                    if normalize_fn is None:
+                        xyz_n = geometry.normalized(xyz_tensor)
+                        t_n = (t_tensor / t_max_val) * 2.0 - 1.0
+                        norm_coords = torch.cat([xyz_n, t_n], dim=1)
+                    else:
+                        norm_coords = normalize_fn(xyz_tensor, t_tensor)
+
+                    T_net = model(norm_coords, cond_vec)
+                    T = T_net + init_temp
+                    T_pred = T.cpu().numpy().reshape(Y.shape)
+
+                    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+                    im = ax.contourf(Y * 1000, Z * 1000, T_pred, levels=50, cmap="inferno")
+                    cbar = plt.colorbar(im, ax=ax)
+                    cbar.set_label("Temperature (K)")
+                    ax.set_xlabel("y (mm)")
+                    ax.set_ylabel("z (mm)")
+                    ax.set_title(f"T (x={x_mm:.0f}mm, t={t_val:.0f}s)\n{condition.name}")
+                    cfg_suffix = f"_{config_name}" if config_name else ""
+                    filename = f"heatmap_yz_x{x_mm:.0f}mm_{condition.name}{cfg_suffix}_t{int(t_val)}s.png"
+                    plt.tight_layout()
+                    plt.savefig(out_dir / filename)
+                    plt.close(fig)
+                    print(f"Saved heatmap to {out_dir / filename}")
+
+    def plot_prediction_vs_true(
+        self,
+        df: pd.DataFrame,
+        point_coords: List[Tuple[float, float, float]],
+        condition_name: str,
+        save_path: str,
+        config_name: str = "",
+    ):
+        """Plot predicted vs true temperature over time for selected spatial points.
+
+        Args:
+            df: DataFrame with columns x_mm, y_mm, z_mm, t, temperature_true, temperature_pred
+            point_coords: List of 3 (x, y, z) tuples in mm
+            condition_name: Condition name for title
+            save_path: Path to save the figure
+            config_name: Optional config name suffix
+        """
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(4.5, 3.0))
+        colors = ["#1f77b4", "#2ca02c", "#d62728"]
+
+        for i, (x_mm, y_mm, z_mm) in enumerate(point_coords):
+            mask = (
+                (np.isclose(df["x_mm"], x_mm))
+                & (np.isclose(df["y_mm"], y_mm))
+                & (np.isclose(df["z_mm"], z_mm))
+            )
+            sub = df.loc[mask].sort_values("t")
+            if sub.empty:
+                continue
+            label = f"({x_mm:.0f}, {y_mm:.0f}, {z_mm:.0f}) mm"
+            c = colors[i % len(colors)]
+            ax.plot(
+                sub["t"],
+                sub["temperature_true"],
+                "-",
+                color=c,
+                linewidth=1.5,
+                label=f"{label} true",
+            )
+            ax.plot(
+                sub["t"],
+                sub["temperature_pred"],
+                "--",
+                color=c,
+                linewidth=1.0,
+                label=f"{label} pred",
+            )
+
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Temperature (K)")
+        ax.set_title(f"Predicted vs True: {condition_name}")
+        ax.legend(frameon=False, ncol=2, fontsize=6)
+        ax.grid(True, ls="-", alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close(fig)
+        print(f"Saved pred vs true plot to {save_path}")

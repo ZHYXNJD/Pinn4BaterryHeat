@@ -1,9 +1,10 @@
 import argparse
+import json
 from pathlib import Path
 
 import torch
 
-from src.config import load_config
+from src.config import config_to_dict, load_config
 from src.trainer import PINNTrainer
 
 
@@ -12,21 +13,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/refactor_default.yaml",
+        # default="configs/refactor_default.yaml",
+        default="configs/refactor_weights_scheme_d.yaml",
         help="Path to YAML configuration file.",
     )
     parser.add_argument(
         "--device",
         type=str,
-        #default="cuda" if torch.cuda.is_available() else "cpu",
         default="cpu",
         help="Training device: cpu or cuda.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="Base output directory for checkpoints, test_results, plots, and TensorBoard logs.",
     )
     parser.add_argument(
         "--save",
         type=str,
         default="pinn_checkpoint.pt",
-        help="Path to save the trained model state.",
+        help="Checkpoint filename. Default derives from config name, e.g. pinn_refactor_weights_scheme_a.pt",
     )
     return parser.parse_args()
 
@@ -34,12 +41,46 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     cfg = load_config(args.config)
-    trainer = PINNTrainer(cfg, device=args.device, output_dir=Path(args.save).parent)
+    config_stem = Path(args.config).stem
+    output_base = Path(args.output_dir)
+    output_dir = output_base / config_stem
+    checkpoint_dir = output_dir / "checkpoints"
+    test_results_dir = output_dir / "test_results"
+    checkpoint_filename = args.save if args.save != "pinn_checkpoint.pt" else f"pinn_{config_stem}.pt"
+    checkpoint_path = checkpoint_dir / checkpoint_filename
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    training_config = {
+        "config_path": args.config,
+        "config": config_to_dict(cfg),
+        "runtime": {
+            "device": args.device,
+            "output_dir": str(output_dir),
+            "checkpoint_dir": str(checkpoint_dir),
+            "test_results_dir": str(test_results_dir),
+            "config_name": config_stem,
+            "checkpoint_filename": checkpoint_filename,
+        },
+    }
+    config_json_path = output_dir / "training_config.json"
+    with config_json_path.open("w", encoding="utf-8") as f:
+        json.dump(training_config, f, indent=2, ensure_ascii=False)
+    print(f"Saved training config to {config_json_path}")
+
+    trainer = PINNTrainer(
+        cfg,
+        device=args.device,
+        output_dir=str(output_dir),
+        checkpoint_dir=str(checkpoint_dir),
+        test_results_dir=str(test_results_dir),
+        config_name=config_stem,
+    )
     trainer.train()
-    Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-    trainer.save(args.save)
-    print(f"Saved checkpoint to {args.save}")
-    # 基于独立测试集评估误差
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    trainer.save(str(checkpoint_path))
+    print(f"Saved checkpoint to {checkpoint_path}")
+
     trainer.evaluate_on_test()
     trainer.evaluate()
 
