@@ -1,0 +1,80 @@
+# 纯数据训练模式：仅用监督数据，不计算任何物理损失
+# 用于与 PINN 对比实验，最大化利用训练集的有监督学习
+
+geometry:
+  length_x_mm: 66.0
+  length_y_mm: 141.0
+  length_z_mm: 218.0
+  cells_x: 8
+  cells_y: 1
+  cold_plate_face: z_min
+
+physics:
+  rho: 3000.0
+  cp: 1100.0
+  k: 2.73
+  k_x: 2.73
+  k_y: 0.91
+  k_z: 2.73
+  t_max: 1800.0
+  init_temp: 313.15
+
+fluid:
+  thickness_mm: 4.0
+  rho: 1261.0
+  cp: 1370.0
+  k: 0.0876
+  vel_m_s: 1.9
+  flow_dir: x
+  inlet_temp: 283.15
+  channel_count: 7
+  channel_pitch_mm: 18.0
+  channel_width_mm: 10.0
+  channel_axis: y
+
+plate:
+  thickness_mm: 4.0
+  rho: 2719.0
+  cp: 871.0
+  k: 202.4
+
+phase_change:
+  enabled: false
+  latent_heat: 190740.0
+  melting_temp: 283.15
+  transition_width: 2.0
+  pcm_region: plate
+
+model:
+  hidden_layers: [128, 128, 128]
+  activation: sine
+  fourier_features: 4
+  fourier_sigma: 1.5
+  max_q_terms: 7
+
+# 有监督学习优化配置
+optim:
+  data_only: true           # 启用纯数据训练
+  lr: 1.0e-2                # 初始学习率，OneCycleLR 会做 warmup 和 cosine decay
+  epochs: 500               # 训练轮数
+  batch_data: 256           # 较大 batch 提升稳定性
+  keep_best_n: 5            # 保留最优 5 个模型
+  save_interval: 100        # 每 100 个 epoch 保存一次
+  print_every: 50
+  plot_every: 200
+  grad_clip: 1.0
+  lr_patience: 0            # data_only 模式用 OneCycleLR，忽略此项
+
+visualization:
+  x_slices_mm: [33.0, 132.0, 264.0, 396.0]
+  heatmap_time_points: [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0]
+
+conditions:
+  - name: base_0p5C
+    q_poly: [34015.27968, -1.78702E+01, 4.81106E-02, -4.54327E-05, 1.45427E-08]
+    t_env: 313.15
+    h_coeff: 800.0
+    inlet_temp: 283.15
+    train_interior: 'sample_data/battery_train_dataset.csv'
+    train_boundary: null
+    test: 'sample_data/battery_test_dataset.csv'

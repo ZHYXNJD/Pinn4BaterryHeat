@@ -1,5 +1,5 @@
-# 方案 C：无 freeze，仅 warmup
-# 所有 loss 从 epoch 1 参与，适度 warmup，中等权重
+# 方案 A：全程参与 + 平衡权重
+# 所有 loss 从 epoch 1 开始参与，适度 warmup
 
 geometry:
   length_x_mm: 66.0
@@ -20,47 +20,37 @@ physics:
   init_temp: 313.15
 
   bc_weight: 1.0
-  bc_warmup_epochs: 800
+  bc_warmup_epochs: 500
   bc_freeze_epochs: 0
-#  bc_temp_scale: 10.0
-  bc_temp_scale: 1.0
+  bc_temp_scale: 10.0
 
-  # 方案 C：无 freeze，cold_bc 权重 1e-4
-  cold_bc_weight: 1
+  # 方案 A：cold_bc 全程参与，权重增大
+  cold_bc_weight: 1.0e-2
   cold_bc_freeze_epochs: 0
-  cold_bc_warmup_epochs: 1
-#  cold_bc_temp_scale: 10.0
-  cold_bc_temp_scale: 1.0
+  cold_bc_warmup_epochs: 500
+  cold_bc_temp_scale: 10.0
 
   data_weight: 1.0
   residual_weight: 1.0
   ic_weight: 1.0
-#  q_scale: 0.3
-# 计算q值的系数 为什么有个缩放？
-  q_scale: 1.0
+  q_scale: 0.3
   h_env: 12.0
 
-  # 方案 C：interface 无 freeze，权重 0.02
-  interface_weight: 1
+  # 方案 A：interface 全程参与，权重增大
+  interface_weight: 0.1
   interface_freeze_epochs: 0
-  interface_warmup_epochs: 1000
-  # 不缩放
-#  interface_temp_scale: 5.0
-  interface_temp_scale: 1.0
-#  interface_flux_scale: 1.0e5
-  interface_flux_scale: 1.0
+  interface_warmup_epochs: 500
+  interface_temp_scale: 5.0
+  interface_flux_scale: 1.0e5
 
-  fluid_residual_weight: 1.0
+  fluid_residual_weight: 0.0
   fluid_residual_freeze_epochs: 0
   fluid_residual_warmup_epochs: 0
-
-  fluid_inlet_weight: 1.0
+  fluid_inlet_weight: 0.0
   fluid_inlet_freeze_epochs: 0
   fluid_inlet_warmup_epochs: 0
 
-  # 为社么又有个smooth weight？
-#  smooth_weight: 1.0e-4
-  smooth_weight: 0.0
+  smooth_weight: 1.0e-4
 
 fluid:
   thickness_mm: 4.0
@@ -77,13 +67,12 @@ fluid:
 
 plate:
   thickness_mm: 4.0
-#  thickness_mm: 0.0
   rho: 2719.0
   cp: 871.0
   k: 202.4
 
 phase_change:
-  enabled: True
+  enabled: false
   latent_heat: 190740.0
   melting_temp: 283.15
   transition_width: 2.0
@@ -97,8 +86,8 @@ model:
   max_q_terms: 7
 
 optim:
-  lr: 5.0e-3
-  epochs: 10000
+  lr: 5.0e-4
+  epochs: 3000
   batch_data: 128
   batch_residual: 128
   batch_boundary: 128
@@ -109,12 +98,7 @@ optim:
   lr_patience: 200
   lr_decay: 0.5
   lr_min: 1.0e-5
-  max_steps_per_epoch: 50
-
-# 评估热力图截面配置 (x 位置 mm, 时间点 s)
-visualization:
-  x_slices_mm: [33.0, 132.0, 264.0, 396.0]   # 多个 x 截面位置
-  heatmap_time_points: [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0]
+  max_steps_per_epoch: 100
 
 conditions:
   - name: base_0p5C
@@ -122,6 +106,6 @@ conditions:
     t_env: 313.15
     h_coeff: 800.0
     inlet_temp: 283.15
-    train_interior: 'sample_data/battery_train_dataset.csv'
-    train_boundary: None
+    train_interior: 'sample_data/battery_train_interior_dataset.csv'
+    train_boundary: 'sample_data/battery_train_boundary_dataset.csv'
     test: 'sample_data/battery_test_dataset.csv'

@@ -154,7 +154,9 @@ class PINNTrainer:
         else:
             self.flow_dir = 2
             self.flow_vec = torch.tensor([0.0, 0.0, cfg.fluid.vel_m_s], device=self.device)
-        if self.cfg.optim.lr_patience > 0:
+        if self.cfg.optim.data_only:
+            self.scheduler = None  # set in _train_data_only with OneCycleLR
+        elif self.cfg.optim.lr_patience > 0:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 factor=self.cfg.optim.lr_decay,
@@ -785,6 +787,59 @@ class PINNTrainer:
         target = torch.full_like(T, cond.inlet_temp)
         return self.mse(T, target)
 
+    def _maybe_save_checkpoints(self, avg_loss: float, epoch: int) -> tuple[float, int]:
+        """
+        按配置保存最优 N 个模型和固定间隔模型。
+        Returns:
+            (best_loss, best_epoch) 用于打印
+        """
+        keep_n = getattr(self.cfg.optim, "keep_best_n", 5)
+        keep_n = max(1, keep_n) if keep_n > 0 else 1
+        save_int = max(0, getattr(self.cfg.optim, "save_interval", 0))
+
+        if not hasattr(self, "_best_models"):
+            self._best_models: list[tuple[float, int, Path]] = []  # (loss, epoch, path)
+
+        # 按 loss 保存最优 N 个
+        if keep_n > 0:
+            qualifies = len(self._best_models) < keep_n or avg_loss < self._best_models[-1][0]
+            if qualifies:
+                path = self.checkpoint_dir / f"pinn_{self.config_name}_best_epoch{epoch:06d}_loss{avg_loss:.4e}.pt"
+                torch.save(
+                    {
+                        "model_state": self.model.state_dict(),
+                        "config": dataclasses.asdict(self.cfg),
+                        "epoch": epoch,
+                        "loss": avg_loss,
+                    },
+                    path,
+                )
+                self._best_models.append((avg_loss, epoch, path))
+                self._best_models.sort(key=lambda x: x[0])
+                if len(self._best_models) > keep_n:
+                    _, _, old_path = self._best_models.pop()
+                    if old_path.exists():
+                        old_path.unlink()
+                print(f"  -> Best model saved at epoch {epoch} (loss={avg_loss:.4e}, top-{len(self._best_models)})")
+
+        # 按固定间隔保存
+        if save_int > 0 and epoch % save_int == 0:
+            int_path = self.checkpoint_dir / f"pinn_{self.config_name}_epoch{epoch:06d}.pt"
+            torch.save(
+                {
+                    "model_state": self.model.state_dict(),
+                    "config": dataclasses.asdict(self.cfg),
+                    "epoch": epoch,
+                    "loss": avg_loss,
+                },
+                int_path,
+            )
+            print(f"  -> Interval checkpoint saved at epoch {epoch}")
+
+        if self._best_models:
+            return self._best_models[0][0], self._best_models[0][1]
+        return float("inf"), 0
+
     def _initial_loss(self, cond: ConditionRuntime) -> torch.Tensor:
         n = self.cfg.optim.batch_initial
         coords = torch.cat(
@@ -802,12 +857,105 @@ class PINNTrainer:
         return self.mse(T, target)
 
     def train(self):
-        """Training loop based on the original per-epoch/per-condition structure.
+        """Training loop. Dispatches to _train_data_only for pure supervised mode."""
+        if self.cfg.optim.data_only:
+            self._train_data_only()
+            return
+        self._train_pinn()
 
-        每个 epoch、每个工况只计算一次 PDE 残差和边界损失；
-        如有配置的监督数据，则在该工况上最多取一个 batch 做 data loss，
-        避免 steps_per_epoch 的额外嵌套导致显存爆炸。
-        """
+    def _train_data_only(self):
+        """纯数据训练：仅用监督数据，不计算物理损失。最大化利用训练集的有监督学习。"""
+        num_conditions = len(self.conditions)
+        if num_conditions == 0:
+            raise ValueError("No training conditions provided.")
+
+        batch_size = self.cfg.optim.batch_data
+        pin_memory = self.device.type == "cuda"
+        num_workers = 4 if self.device.type == "cuda" else 0
+
+        interior_loaders: list[DataLoader] = []
+        dataset_sizes: list[int] = []
+
+        print("Data-only mode: initializing datasets (pure supervised learning, no physics loss)...")
+        for i, cond in enumerate(self.conditions):
+            has_interior = getattr(cond, "train_interior", None)
+            if not has_interior:
+                raise ValueError(f"data_only mode requires train_interior for condition {i} ({cond.name})")
+            print(f"  - Condition {i} ({cond.name}): train_interior = {has_interior}")
+            ds = BatteryDataset(has_interior)
+            ld = DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=pin_memory,
+                num_workers=num_workers,
+            )
+            interior_loaders.append(ld)
+            dataset_sizes.append(len(ds))
+
+        steps_per_epoch = max((s + batch_size - 1) // batch_size for s in dataset_sizes)
+        total_steps = self.cfg.optim.epochs * steps_per_epoch
+
+        # 有监督学习常用：OneCycleLR 或 CosineAnnealing
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.cfg.optim.lr,
+            total_steps=total_steps,
+            pct_start=0.1,
+            anneal_strategy="cos",
+            div_factor=10.0,
+            final_div_factor=100.0,
+        )
+
+        ld_iterators = [cycle(ld) for ld in interior_loaders]
+
+        global_step = 0
+        for epoch in range(1, self.cfg.optim.epochs + 1):
+            epoch_loss = 0.0
+            step_count = 0
+
+            for step in range(steps_per_epoch):
+                self.optimizer.zero_grad()
+                loss_sum = torch.tensor(0.0, device=self.device)
+                n_cond_with_data = 0
+
+                for idx, cond in enumerate(self.conditions):
+                    x_int, y_int = next(ld_iterators[idx])
+                    loss_data = self._data_loss(cond, x_int, y_int)
+                    loss_sum = loss_sum + loss_data
+                    n_cond_with_data += 1
+
+                if n_cond_with_data > 0:
+                    loss = loss_sum / n_cond_with_data
+                    loss.backward()
+                    if self.cfg.optim.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optim.grad_clip)
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    epoch_loss += loss.item()
+                    step_count += 1
+                global_step += 1
+
+            avg_loss = epoch_loss / max(step_count, 1)
+            best_loss, best_epoch = self._maybe_save_checkpoints(avg_loss, epoch)
+
+            if epoch % self.cfg.optim.print_every == 0:
+                lr = self.optimizer.param_groups[0]["lr"]
+                print(f"[{epoch:06d}] loss={avg_loss:.4e} lr={lr:.2e}")
+
+            self.visualizer.log_loss(avg_loss, avg_loss, 0.0, 0.0, 0.0)
+            self.writer.add_scalar("loss/total", avg_loss, epoch)
+            self.writer.add_scalar("loss/data", avg_loss, epoch)
+            self.writer.add_scalar("optim/learning_rate", self.optimizer.param_groups[0]["lr"], epoch)
+
+            if epoch % self.cfg.optim.plot_every == 0:
+                self.visualizer.plot_loss(epoch)
+
+        self.writer.close()
+        print(f"Data-only training done. Best model: epoch {best_epoch} (loss={best_loss:.4e})")
+
+    def _train_pinn(self):
+        """PINN 训练循环：物理损失 + 数据损失。"""
 
         def scheduled_weight(base: float, epoch: int, warmup: int = 0, freeze: int = 0) -> float:
             if base <= 0:
@@ -856,9 +1004,6 @@ class PINNTrainer:
             "fluid_inlet": 1.0,
             "interface": 1.0,
         }
-
-        best_loss = float("inf")
-        best_epoch = 0
 
         for epoch in range(1, self.cfg.optim.epochs + 1):
             epoch_loss = 0.0
@@ -991,20 +1136,8 @@ class PINNTrainer:
             avg_total = epoch_loss / num_steps_total
             avg_data = total_data / num_steps_total
 
-            if avg_total < best_loss:
-                best_loss = avg_total
-                best_epoch = epoch
-                best_path = self.checkpoint_dir / f"pinn_{self.config_name}_best.pt"
-                torch.save(
-                    {
-                        "model_state": self.model.state_dict(),
-                        "config": dataclasses.asdict(self.cfg),
-                        "epoch": epoch,
-                        "loss": avg_total,
-                    },
-                    best_path,
-                )
-                print(f"  -> Best model saved at epoch {epoch} (loss={avg_total:.4e})")
+            best_loss, best_epoch = self._maybe_save_checkpoints(avg_total, epoch)
+
             avg_res = total_res / num_steps_total
             avg_fluid_res = total_fluid_res / num_steps_total
             avg_bc = total_bc / num_steps_total

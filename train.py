@@ -1,5 +1,6 @@
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -14,14 +15,14 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=str,
         # default="configs/refactor_default.yaml",
-        default="configs/refactor_weights_scheme_d.yaml",
+        default="configs/data_only.yaml",
         help="Path to YAML configuration file.",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
-        help="Training device: cpu or cuda.",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Training device: cpu or cuda. Default: cuda if available.",
     )
     parser.add_argument(
         "--output_dir",
@@ -42,8 +43,9 @@ def main():
     args = parse_args()
     cfg = load_config(args.config)
     config_stem = Path(args.config).stem
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_base = Path(args.output_dir)
-    output_dir = output_base / config_stem
+    output_dir = output_base / f"{config_stem}_{timestamp}"
     checkpoint_dir = output_dir / "checkpoints"
     test_results_dir = output_dir / "test_results"
     checkpoint_filename = args.save if args.save != "pinn_checkpoint.pt" else f"pinn_{config_stem}.pt"

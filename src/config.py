@@ -136,6 +136,12 @@ class OptimConfig:
     max_steps_per_epoch: Optional[int] = None
     # 自适应 loss 权重：根据各 loss 分量的 EMA 归一化，避免单一分量主导
     adaptive_loss_weights: bool = False
+    # 纯数据训练模式：仅用监督数据，不计算任何物理损失（residual/boundary/ic 等）
+    data_only: bool = False
+    # 保留最优 N 个模型（按 loss 排序），0 表示只保留 1 个最优
+    keep_best_n: int = 5
+    # 按固定间隔保存模型（每 N 个 epoch 保存一次），0 表示不按间隔保存
+    save_interval: int = 0
 
 
 @dataclasses.dataclass
