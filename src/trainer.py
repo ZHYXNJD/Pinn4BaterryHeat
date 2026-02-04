@@ -9,6 +9,7 @@ from typing import List
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -100,6 +101,7 @@ class PINNTrainer:
             activation=cfg.model.activation,
             fourier_features=cfg.model.fourier_features,
             fourier_sigma=cfg.model.fourier_sigma,
+            time_embed_freqs=getattr(cfg.model, "time_embed_freqs", 0),
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.optim.lr)
         self.mse = nn.MSELoss()
@@ -412,8 +414,28 @@ class PINNTrainer:
         temperature_target = y_batch.to(self.device).view(-1, 1)
         cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(temperature_target.shape[0], 1)
         T_net = self.model(norm_coords, cond_vec)
-        T = T_net + self.cfg.physics.init_temp
-        return self.mse(T, temperature_target)
+        scale = getattr(self.cfg.physics, "output_temp_scale", 0.0)
+        if scale > 0:
+            target_norm = (temperature_target - self.cfg.physics.init_temp) / scale
+            sq_err = (T_net - target_norm) ** 2
+        else:
+            T = T_net + self.cfg.physics.init_temp
+            sq_err = (T - temperature_target) ** 2
+        # 冷却区加权：缓解冷却板附近样本少导致模型无法学到温度下降
+        cw = getattr(self.cfg.physics, "cooling_region_weight", 1.0)
+        z_thr = getattr(self.cfg.physics, "cooling_z_threshold_mm", -50.0) / 1000.0  # mm -> m
+        if cw != 1.0 and z_thr < 0:
+            w = torch.where(xyz[:, 2] < z_thr, torch.full_like(xyz[:, 2], cw), torch.ones_like(xyz[:, 2]))
+            w = w.view(-1, 1)
+            return (w * sq_err).sum() / w.sum().clamp(min=1e-6)
+        return sq_err.mean()
+
+    def _model_to_temp(self, T_net: torch.Tensor) -> torch.Tensor:
+        """将模型输出转为温度 (K)。"""
+        scale = getattr(self.cfg.physics, "output_temp_scale", 0.0)
+        if scale > 0:
+            return T_net * scale + self.cfg.physics.init_temp
+        return T_net + self.cfg.physics.init_temp
 
     def _residual_loss(self, cond: ConditionRuntime) -> torch.Tensor:
         n = self.cfg.optim.batch_residual
@@ -577,7 +599,6 @@ class PINNTrainer:
         dTdx, dTdy, dTdz = grads[:, 0:1], grads[:, 1:2], grads[:, 2:3]
         dTdn = (dTdx * normals[:, 0:1] + dTdy * normals[:, 1:2] + dTdz * normals[:, 2:3])
 
-        # 使用观测温度作为参考温度，而不是固定的cond.t_env
         # Equivalent convection: k_n * dT/dn + h * (T - T_obs) = 0
         h_env = torch.full_like(dTdn, self.cfg.physics.h_env)
         T_ref = torch.full_like(T, cond.t_env)
@@ -871,7 +892,7 @@ class PINNTrainer:
 
         batch_size = self.cfg.optim.batch_data
         pin_memory = self.device.type == "cuda"
-        num_workers = 4 if self.device.type == "cuda" else 0
+        num_workers = 8 if self.device.type == "cuda" else 0
 
         interior_loaders: list[DataLoader] = []
         dataset_sizes: list[int] = []
@@ -975,21 +996,23 @@ class PINNTrainer:
         # 为每个工况构建一次性的 Dataset/DataLoader（如果配置了路径）
         batch_size = self.cfg.optim.batch_data
         interior_loaders: list[DataLoader | None] = []
+        dataset_sizes: list[int] = []
 
         print("Initializing Datasets from config (per-condition, no step loop)...")
         for i, cond in enumerate(self.conditions):
             has_interior = getattr(cond, "train_interior", None)
 
-            ld_int = None
             if has_interior:
                 print(f"  - Condition {i} ({cond.name}): train_interior = {has_interior}")
                 ds_int = BatteryDataset(has_interior)
                 ld_int = DataLoader(ds_int, batch_size=batch_size, shuffle=True)
 
-            interior_loaders.append(ld_int)
+                interior_loaders.append(ld_int)
+                dataset_sizes.append(len(ds_int))
 
+        # steps_per_epoch = max((s + batch_size - 1) // batch_size for s in dataset_sizes)
         steps_per_epoch = self.cfg.optim.max_steps_per_epoch if self.cfg.optim.max_steps_per_epoch is not None else 1
-        use_adaptive = getattr(self.cfg.optim, "adaptive_loss_weights", False)
+        use_adaptive = getattr(self.cfg.optim, "adaptive_loss_weights", True)
         if steps_per_epoch > 1 or use_adaptive:
             print(f"  steps_per_epoch={steps_per_epoch}, adaptive_loss_weights={use_adaptive}")
         ema_decay = 0.9
@@ -1021,7 +1044,20 @@ class PINNTrainer:
                 for ld in interior_loaders
             ]
 
-            for step in range(steps_per_epoch):
+            step_loss_prev = epoch_loss
+            step_data_prev = total_data
+            step_res_prev = total_res
+            step_bc_prev = total_bc
+            step_ic_prev = total_ic
+
+            pbar = tqdm(
+                range(steps_per_epoch),
+                desc=f"Epoch {epoch}/{self.cfg.optim.epochs}",
+                unit="step",
+                dynamic_ncols=True,
+                leave=(epoch % self.cfg.optim.print_every == 0),
+            )
+            for step in pbar:
                 self.optimizer.zero_grad()
 
                 bc_w = scheduled_weight(
@@ -1054,11 +1090,15 @@ class PINNTrainer:
                     warmup=self.cfg.physics.interface_warmup_epochs,
                     freeze=self.cfg.physics.interface_freeze_epochs,
                 )
+                data_w = scheduled_weight(
+                    getattr(self.cfg.physics, "data_weight", 1.0),
+                    epoch,
+                    warmup=getattr(self.cfg.physics, "data_warmup_epochs", 0),
+                    freeze=getattr(self.cfg.physics, "data_freeze_epochs", 0),
+                )
 
                 for idx, cond in enumerate(self.conditions):
                     loss_data = torch.tensor(0.0, device=self.device)
-
-
                     ld_iter = ld_iterators[idx]
                     if ld_iter is not None:
                         x_int, y_int = next(ld_iter)
@@ -1074,7 +1114,6 @@ class PINNTrainer:
                     fluid_inlet_loss = self._fluid_inlet_loss(cond)
                     interface_loss = self._interface_loss(cond)
 
-                    data_weight = getattr(self.cfg.physics, "data_weight", 1.0)
                     res_val = (res_loss + plate_res_loss).item()
                     bc_val = bc_loss.item()
 
@@ -1087,7 +1126,9 @@ class PINNTrainer:
                         loss_ema["fluid_res"] = ema_decay * loss_ema["fluid_res"] + (1 - ema_decay) * fluid_res_loss.item()
                         loss_ema["fluid_inlet"] = ema_decay * loss_ema["fluid_inlet"] + (1 - ema_decay) * fluid_inlet_loss.item()
                         loss_ema["interface"] = ema_decay * loss_ema["interface"] + (1 - ema_decay) * interface_loss.item()
-                        scale_data = 1.0 / (loss_ema["data"] + ema_eps)
+                        # 数据项不使用自适应缩放：否则 data loss 大时 scale_data 变小，梯度被压低，
+                        # 导致 data loss 难以下降（物理损失下降后其 scale 变大，进一步主导梯度）。
+                        scale_data = 1.0
                         scale_res = 1.0 / (loss_ema["res"] + ema_eps)
                         scale_bc = 1.0 / (loss_ema["bc"] + ema_eps)
                         scale_cold_bc = 1.0 / (loss_ema["cold_bc"] + ema_eps)
@@ -1096,7 +1137,7 @@ class PINNTrainer:
                         scale_fluid_inlet = 1.0 / (loss_ema["fluid_inlet"] + ema_eps)
                         scale_interface = 1.0 / (loss_ema["interface"] + ema_eps)
                         loss = (
-                            data_weight * loss_data * scale_data
+                            data_w * loss_data * scale_data
                             + bc_w * bc_loss * scale_bc
                             + self.cfg.physics.residual_weight * (res_loss + plate_res_loss) * scale_res
                             + fluid_res_w * fluid_res_loss * scale_fluid_res
@@ -1107,7 +1148,7 @@ class PINNTrainer:
                         )
                     else:
                         loss = (
-                            data_weight * loss_data
+                            data_w * loss_data
                             + bc_w * bc_loss
                             + self.cfg.physics.residual_weight * (res_loss + plate_res_loss)
                             + fluid_res_w * fluid_res_loss
@@ -1131,6 +1172,22 @@ class PINNTrainer:
                 if self.cfg.optim.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optim.grad_clip)
                 self.optimizer.step()
+
+                # 更新进度条：当前步的关键指标
+                lr = self.optimizer.param_groups[0]["lr"]
+                pbar.set_postfix(
+                    loss=f"{(epoch_loss - step_loss_prev) / max(num_conditions, 1):.2e}",
+                    data=f"{(total_data - step_data_prev) / max(num_conditions, 1):.2e}",
+                    res=f"{(total_res - step_res_prev) / max(num_conditions, 1):.2e}",
+                    bc=f"{(total_bc - step_bc_prev) / max(num_conditions, 1):.2e}",
+                    ic=f"{(total_ic - step_ic_prev) / max(num_conditions, 1):.2e}",
+                    lr=f"{lr:.1e}",
+                )
+                step_loss_prev = epoch_loss
+                step_data_prev = total_data
+                step_res_prev = total_res
+                step_bc_prev = total_bc
+                step_ic_prev = total_ic
 
             num_steps_total = steps_per_epoch * num_conditions
             avg_total = epoch_loss / num_steps_total
@@ -1243,7 +1300,7 @@ class PINNTrainer:
                     norm_coords = self._normalize(xyz, t)
                     cond_vec = cond.vector().to(self.device).unsqueeze(0).repeat(y_batch.shape[0], 1)
                     T_net = self.model(norm_coords, cond_vec)
-                    T = T_net + cond.t_env
+                    T = self._model_to_temp(T_net)
                     target = y_batch.to(self.device).view(-1, 1)
                     rel_err = (T - target).abs() / (target.abs() + 1e-3)
                     all_errors.append(rel_err.detach().cpu().view(-1))
@@ -1339,6 +1396,7 @@ class PINNTrainer:
                 normalize_fn=self._normalize,
                 save_dir=str(save_dir),
                 config_name=self.config_name,
+                model_to_temp_fn=self._model_to_temp,
             )
 
         if results:

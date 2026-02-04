@@ -196,6 +196,7 @@ class Visualizer:
         normalize_fn=None,
         save_dir=None,
         config_name: str = "",
+        model_to_temp_fn=None,
     ):
         """Plot yz-plane temperature heatmaps at fixed x positions for multiple time points.
 
@@ -247,7 +248,7 @@ class Visualizer:
                         norm_coords = normalize_fn(xyz_tensor, t_tensor)
 
                     T_net = model(norm_coords, cond_vec)
-                    T = T_net + init_temp
+                    T = model_to_temp_fn(T_net) if model_to_temp_fn is not None else T_net + init_temp
                     T_pred = T.cpu().numpy().reshape(Y.shape)
 
                     fig, ax = plt.subplots(figsize=(3.5, 3.0))

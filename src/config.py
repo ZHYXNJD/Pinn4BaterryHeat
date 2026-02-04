@@ -29,6 +29,8 @@ class PhysicsConfig:
     init_temp: float = 298.15  # Kelvin
     # 监督数据与残差的权重，用于快速调节收敛行为
     data_weight: float = 1.0
+    data_warmup_epochs: int = 0  # 前 N 个 epoch 内 data 权重从 0 线性增至 data_weight，避免一上来强拟合数据导致物理项先升后降、ic/fluid_inlet 先降后升
+    data_freeze_epochs: int = 0   # 前 N 个 epoch 内 data_weight=0（纯物理），再开启 data（与 warmup 二选一或组合：freeze 后再 warmup）
     bc_weight: float = 1.0
     ic_weight: float = 1.0
     residual_weight: float = 1.0
@@ -53,6 +55,11 @@ class PhysicsConfig:
     fluid_residual_freeze_epochs: int = 0  # epochs to keep fluid residual off
     fluid_inlet_freeze_epochs: int = 0  # epochs to keep fluid inlet off
     smooth_weight: float = 0.0  # optional spatial gradient penalty to damp high-frequency noise
+    # 纯数据训练时对温度目标做归一化：(T - init_temp) / output_temp_scale，便于网络学习。>0 启用
+    output_temp_scale: float = 0.0
+    # 冷却区样本权重：当 z < cooling_z_threshold_mm 时，data loss 乘以该权重。用于缓解冷却区样本过少导致的预测塌缩
+    cooling_region_weight: float = 1.0
+    cooling_z_threshold_mm: float = -50.0
 
 
 @dataclasses.dataclass
@@ -109,6 +116,7 @@ class ModelConfig:
     fourier_features: int = 6
     fourier_sigma: float = 3.0
     max_q_terms: int = 8
+    time_embed_freqs: int = 0  # 显式 sin/cos 时间编码频率数，>0 便于学习 T(t)
 
 
 @dataclasses.dataclass

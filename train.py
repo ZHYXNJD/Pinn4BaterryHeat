@@ -14,8 +14,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        # default="configs/refactor_default.yaml",
-        default="configs/data_only.yaml",
+        default="configs/refactor_weights_scheme_d.yaml",
+        # default="configs/data_only.yaml",
         help="Path to YAML configuration file.",
     )
     parser.add_argument(

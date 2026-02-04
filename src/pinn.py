@@ -5,6 +5,14 @@ import torch
 from torch import nn
 
 
+def sinusoidal_time_embedding(t: torch.Tensor, num_freqs: int = 4) -> torch.Tensor:
+    """显式时间编码：sin/cos 多尺度，便于模型学习 T(t) 的时间依赖。t 已归一化到 [-1,1]。"""
+    freqs = 2.0 * math.pi * torch.arange(1, num_freqs + 1, device=t.device, dtype=t.dtype)
+    t_flat = t.squeeze(-1)
+    args = freqs * t_flat.unsqueeze(-1)
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
 class FourierFeatures(nn.Module):
     def __init__(self, in_dim: int, num_features: int, sigma: float = 3.0):
         super().__init__()
@@ -37,6 +45,7 @@ class PINNModel(nn.Module):
         activation: str = "sine",
         fourier_features: int = 6,
         fourier_sigma: float = 3.0,
+        time_embed_freqs: int = 0,
     ):
         super().__init__()
         act = self._make_activation(activation)
@@ -44,8 +53,11 @@ class PINNModel(nn.Module):
         self.cond_encoder = ConditionEncoder(cond_dim)
         self.use_fourier = fourier_features > 0
         self.fourier = FourierFeatures(4, fourier_features, sigma=fourier_sigma) if self.use_fourier else None
+        self.time_embed_freqs = max(0, time_embed_freqs)
 
         input_dim = 4 + (2 * fourier_features if self.use_fourier else 0) + 64
+        if self.time_embed_freqs > 0:
+            input_dim += 2 * self.time_embed_freqs
         layers = []
         last_dim = input_dim
         for h in hidden_layers:
@@ -81,11 +93,14 @@ class PINNModel(nn.Module):
 
     def forward(self, coords: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         cond_embed = self.cond_encoder(cond)
+        parts = [coords]
         if self.use_fourier:
-            ff = self.fourier(coords)
-            x = torch.cat([coords, ff, cond_embed], dim=-1)
-        else:
-            x = torch.cat([coords, cond_embed], dim=-1)
+            parts.append(self.fourier(coords))
+        if self.time_embed_freqs > 0:
+            t = coords[:, 3:4]
+            parts.append(sinusoidal_time_embedding(t, self.time_embed_freqs))
+        parts.append(cond_embed)
+        x = torch.cat(parts, dim=-1)
         return self.net(x)
 
 

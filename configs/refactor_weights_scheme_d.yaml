@@ -1,6 +1,8 @@
 # 方案 C：无 freeze，仅 warmup
 # 所有 loss 从 epoch 1 参与，适度 warmup，中等权重
 
+# 可以完美运行的版本
+
 geometry:
   length_x_mm: 66.0
   length_y_mm: 141.0
@@ -18,6 +20,8 @@ physics:
   k_z: 2.73
   t_max: 1800.0
   init_temp: 313.15
+  cooling_region_weight: 20.0   # 冷却区样本权重，缓解无法学到温度下降
+  cooling_z_threshold_mm: -50.0
 
   bc_weight: 1.0
   bc_warmup_epochs: 800
@@ -95,21 +99,24 @@ model:
   fourier_features: 4
   fourier_sigma: 1.5
   max_q_terms: 7
+  time_embed_freqs: 8       # 显式时间编码，便于学习 T(t)
 
+# 建议：先用 data_only 探路得到 lr、batch_data，再在此基础上调物理权重
 optim:
-  lr: 5.0e-3
-  epochs: 10000
-  batch_data: 128
+  lr: 5.0e-3              # 可与 data_only 探路得到的 lr 对比，必要时沿用
+  epochs: 100
+  batch_data: 128         # 应与 data_only 一致
   batch_residual: 128
   batch_boundary: 128
   batch_initial: 64
-  print_every: 50
-  plot_every: 500
+  print_every: 10
+  plot_every: 50
   grad_clip: 1.0
-  lr_patience: 200
+  lr_patience: 20
   lr_decay: 0.5
   lr_min: 1.0e-5
-  max_steps_per_epoch: 50
+  max_steps_per_epoch: 5000
+  adaptive_loss_weights: True
 
 # 评估热力图截面配置 (x 位置 mm, 时间点 s)
 visualization:
