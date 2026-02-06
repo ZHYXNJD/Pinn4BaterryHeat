@@ -18,7 +18,7 @@ physics:
   k_x: 2.73
   k_y: 0.91
   k_z: 2.73
-  t_max: 1800.0
+  t_max: 3600.0 # {2c40:1800, 1c40:3600,1.5c40:2400,1.5c25:2400}
   init_temp: 313.15
   cooling_region_weight: 20.0   # 冷却区样本权重，缓解无法学到温度下降
   cooling_z_threshold_mm: -50.0
@@ -104,7 +104,7 @@ model:
 # 建议：先用 data_only 探路得到 lr、batch_data，再在此基础上调物理权重
 optim:
   lr: 5.0e-3              # 可与 data_only 探路得到的 lr 对比，必要时沿用
-  epochs: 100
+  epochs: 20
   batch_data: 128         # 应与 data_only 一致
   batch_residual: 128
   batch_boundary: 128
@@ -112,23 +112,29 @@ optim:
   print_every: 10
   plot_every: 50
   grad_clip: 1.0
-  lr_patience: 20
+  lr_patience: 5
   lr_decay: 0.5
   lr_min: 1.0e-5
-  max_steps_per_epoch: 5000
+  max_steps_per_epoch: 7000
   adaptive_loss_weights: True
 
 # 评估热力图截面配置 (x 位置 mm, 时间点 s)
 visualization:
   x_slices_mm: [33.0, 132.0, 264.0, 396.0]   # 多个 x 截面位置
-  heatmap_time_points: [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0]
+#  heatmap_time_points: [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0] # 2c40
+  heatmap_time_points: [600.0, 1200.0, 1800.0, 2400.0, 3000.0, 3600.0]  # 1c40
+#  heatmap_time_points: [400.0, 800.0, 1200.0, 1600.0, 2000.0, 2400.0] # 1.5c40
+#  heatmap_time_points: [400.0, 800.0, 1200.0, 1600.0, 2000.0, 2400.0] # 1.5c25
 
 conditions:
-  - name: base_0p5C
-    q_poly: [34015.27968, -1.78702E+01, 4.81106E-02, -4.54327E-05, 1.45427E-08]
+  - name: 1c40
+#    q_poly: [34015.27968, -1.78702E+01, 4.81106E-02, -4.54327E-05, 1.45427E-08] # 2c40
+    q_poly: [11914.00389,-2.27624E+00,3.76438E-03,-2.22995E-06,4.68371E-10] # 1c40
+#    q_poly: [21848.38947,-1.00520E+01,2.70622E-02,-2.55559E-05,8.18028E-09 ] # 1.5c40
+#    q_poly: [21154.84461,,-1.00520E+01,2.70622E-02,-2.55559E-05,8.18028E-09] # 1.5c25
     t_env: 313.15
     h_coeff: 800.0
     inlet_temp: 283.15
-    train_interior: 'sample_data/battery_train_dataset.csv'
+    train_interior: 'sample_data/battery_train_dataset_1C40.csv'
     train_boundary: None
-    test: 'sample_data/battery_test_dataset.csv'
+    test: 'sample_data/battery_test_dataset_1C40.csv'

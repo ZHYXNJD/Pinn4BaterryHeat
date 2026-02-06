@@ -21,6 +21,18 @@ class Visualizer:
             "fluid_inlet": [],
             "interface": [],
         }
+        # 按训练步长记录的 loss，用于按 step 绘制
+        self.step_loss_history: Dict[str, List[float]] = {
+            "total": [],
+            "data": [],
+            "residual": [],
+            "boundary": [],
+            "initial": [],
+            "fluid_residual": [],
+            "fluid_inlet": [],
+            "interface": [],
+        }
+        self.step_indices: List[int] = []
         self._setup_style()
 
     def _setup_style(self):
@@ -69,6 +81,29 @@ class Visualizer:
         self.loss_history["fluid_inlet"].append(fluid_inlet)
         self.loss_history["interface"].append(interface)
 
+    def log_loss_step(
+        self,
+        step: int,
+        total: float,
+        data: float,
+        res: float,
+        bc: float,
+        ic: float,
+        fluid_res: float = 0.0,
+        fluid_inlet: float = 0.0,
+        interface: float = 0.0,
+    ):
+        """按训练步长记录 loss，用于按 step 绘制曲线。"""
+        self.step_indices.append(step)
+        self.step_loss_history["total"].append(total)
+        self.step_loss_history["data"].append(data)
+        self.step_loss_history["residual"].append(res)
+        self.step_loss_history["boundary"].append(bc)
+        self.step_loss_history["initial"].append(ic)
+        self.step_loss_history["fluid_residual"].append(fluid_res)
+        self.step_loss_history["fluid_inlet"].append(fluid_inlet)
+        self.step_loss_history["interface"].append(interface)
+
     def plot_loss(self, epoch: int):
         fig, ax = plt.subplots(figsize=(3.5, 2.5)) 
         
@@ -115,6 +150,52 @@ class Visualizer:
         plt.savefig(self.save_dir / "loss_history.png")
         plt.close(fig)
         print(f"Saved loss plot to {self.save_dir / 'loss_history.png'}")
+
+    def plot_loss_by_step(self):
+        """按训练步长（step）绘制 loss 曲线，适用于每 epoch 步数较多时的细粒度查看。"""
+        if not self.step_indices:
+            return
+        fig, ax = plt.subplots(figsize=(3.5, 2.5))
+        steps = self.step_indices
+        ax.plot(steps, self.step_loss_history["total"], label="Total", color="#d62728")
+        ax.plot(steps, self.step_loss_history["data"], label="Data")
+        ax.plot(steps, self.step_loss_history["residual"], label="Residual", color="#1f77b4", linestyle="--")
+        ax.plot(steps, self.step_loss_history["boundary"], label="Boundary", color="#2ca02c", linestyle=":")
+        ax.plot(steps, self.step_loss_history["initial"], label="Initial", color="#ff7f0e", linestyle="-.")
+        if any(self.step_loss_history["fluid_residual"]):
+            ax.plot(
+                steps,
+                self.step_loss_history["fluid_residual"],
+                label="Fluid residual",
+                color="#9467bd",
+                linestyle="--",
+            )
+        if any(self.step_loss_history["fluid_inlet"]):
+            ax.plot(
+                steps,
+                self.step_loss_history["fluid_inlet"],
+                label="Fluid inlet",
+                color="#8c564b",
+                linestyle=":",
+            )
+        if any(self.step_loss_history["interface"]):
+            ax.plot(
+                steps,
+                self.step_loss_history["interface"],
+                label="Interface",
+                color="#17becf",
+                linestyle="-.",
+            )
+        ax.set_yscale("log")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss (MSE)")
+        ax.set_title("Training Loss Convergence (by Step)")
+        ax.legend(frameon=False)
+        ax.grid(True, which="both", ls="-", alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(self.save_dir / "loss_history_by_step.png")
+        plt.close(fig)
+        print(f"Saved loss-by-step plot to {self.save_dir / 'loss_history_by_step.png'}")
 
     def plot_temperature(
         self,
@@ -191,6 +272,8 @@ class Visualizer:
         condition,
         t_max_val: float,
         init_temp: float,
+        temperature_max,
+        temperature_min,
         x_positions_mm: List[float] = None,
         time_points: List[float] = None,
         normalize_fn=None,
@@ -205,7 +288,7 @@ class Visualizer:
             time_points: list of times in seconds, e.g. [300, 600, 900, 1200, 1500, 1800]
         """
         if time_points is None:
-            time_points = [300.0, 600.0, 900.0, 1200.0, 1500.0, t_max_val]
+            time_points = [t_max_val]
         if x_positions_mm is None:
             x_positions_mm = [33.0]
         x_list = [float(x) for x in x_positions_mm]
@@ -252,7 +335,7 @@ class Visualizer:
                     T_pred = T.cpu().numpy().reshape(Y.shape)
 
                     fig, ax = plt.subplots(figsize=(3.5, 3.0))
-                    im = ax.contourf(Y * 1000, Z * 1000, T_pred, levels=50, cmap="inferno")
+                    im = ax.contourf(Y * 1000, Z * 1000, T_pred, levels=50, cmap="inferno",vmax=temperature_max+5, vmin=temperature_min-5)
                     cbar = plt.colorbar(im, ax=ax)
                     cbar.set_label("Temperature (K)")
                     ax.set_xlabel("y (mm)")

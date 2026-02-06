@@ -42,13 +42,12 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     cfg = load_config(args.config)
-    config_stem = Path(args.config).stem
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
     output_base = Path(args.output_dir)
-    output_dir = output_base / f"{config_stem}_{timestamp}"
+    output_dir = output_base / f"{cfg.conditions[0].name}_{timestamp}"
     checkpoint_dir = output_dir / "checkpoints"
     test_results_dir = output_dir / "test_results"
-    checkpoint_filename = args.save if args.save != "pinn_checkpoint.pt" else f"pinn_{config_stem}.pt"
+    checkpoint_filename = args.save if args.save != "pinn_checkpoint.pt" else f"pinn_{cfg.conditions[0].name}.pt"
     checkpoint_path = checkpoint_dir / checkpoint_filename
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -60,7 +59,6 @@ def main():
             "output_dir": str(output_dir),
             "checkpoint_dir": str(checkpoint_dir),
             "test_results_dir": str(test_results_dir),
-            "config_name": config_stem,
             "checkpoint_filename": checkpoint_filename,
         },
     }
@@ -75,7 +73,7 @@ def main():
         output_dir=str(output_dir),
         checkpoint_dir=str(checkpoint_dir),
         test_results_dir=str(test_results_dir),
-        config_name=config_stem,
+        config_name=cfg.conditions[0].name,
     )
     trainer.train()
 

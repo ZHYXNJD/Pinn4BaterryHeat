@@ -84,7 +84,7 @@ class PINNTrainer:
 
         plots_dir = self.output_dir / "plots"
         runs_dir = self.output_dir / "runs"
-        log_dir = runs_dir / f"PINN_{self.config_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_dir = runs_dir / f"PINN_{self.config_name}_{datetime.now().strftime('m%d_%H%M%S')}"
         runs_dir.mkdir(parents=True, exist_ok=True)
         gx = cfg.geometry.length_x_mm * max(cfg.geometry.cells_x, 1) / 1000.0
         gy = cfg.geometry.length_y_mm * max(cfg.geometry.cells_y, 1) / 1000.0
@@ -825,7 +825,7 @@ class PINNTrainer:
         if keep_n > 0:
             qualifies = len(self._best_models) < keep_n or avg_loss < self._best_models[-1][0]
             if qualifies:
-                path = self.checkpoint_dir / f"pinn_{self.config_name}_best_epoch{epoch:06d}_loss{avg_loss:.4e}.pt"
+                path = self.checkpoint_dir / f"pinn_{self.config_name}_best_epoch{epoch:03d}_loss{avg_loss:.4e}.pt"
                 torch.save(
                     {
                         "model_state": self.model.state_dict(),
@@ -1048,7 +1048,11 @@ class PINNTrainer:
             step_data_prev = total_data
             step_res_prev = total_res
             step_bc_prev = total_bc
+            step_cold_bc_prev = total_cold_bc
             step_ic_prev = total_ic
+            step_fluid_res_prev = total_fluid_res
+            step_fluid_inlet_prev = total_fluid_inlet
+            step_interface_prev = total_interface
 
             pbar = tqdm(
                 range(steps_per_epoch),
@@ -1175,19 +1179,38 @@ class PINNTrainer:
 
                 # 更新进度条：当前步的关键指标
                 lr = self.optimizer.param_groups[0]["lr"]
+                n_cond = max(num_conditions, 1)
                 pbar.set_postfix(
-                    loss=f"{(epoch_loss - step_loss_prev) / max(num_conditions, 1):.2e}",
-                    data=f"{(total_data - step_data_prev) / max(num_conditions, 1):.2e}",
-                    res=f"{(total_res - step_res_prev) / max(num_conditions, 1):.2e}",
-                    bc=f"{(total_bc - step_bc_prev) / max(num_conditions, 1):.2e}",
-                    ic=f"{(total_ic - step_ic_prev) / max(num_conditions, 1):.2e}",
+                    loss=f"{(epoch_loss - step_loss_prev) / n_cond:.2e}",
+                    data=f"{(total_data - step_data_prev) / n_cond:.2e}",
+                    res=f"{(total_res - step_res_prev) / n_cond:.2e}",
+                    bc=f"{(total_bc - step_bc_prev) / n_cond:.2e}",
+                    ic=f"{(total_ic - step_ic_prev) / n_cond:.2e}",
                     lr=f"{lr:.1e}",
+                )
+                # 按步记录 loss，用于按 step 绘制曲线（boundary = bc + cold_bc，与 epoch 一致）
+                global_step = (epoch - 1) * steps_per_epoch + step + 1
+                step_bc_combined = (total_bc - step_bc_prev + total_cold_bc - step_cold_bc_prev) / n_cond
+                self.visualizer.log_loss_step(
+                    global_step,
+                    (epoch_loss - step_loss_prev) / n_cond,
+                    (total_data - step_data_prev) / n_cond,
+                    (total_res - step_res_prev) / n_cond,
+                    step_bc_combined,
+                    (total_ic - step_ic_prev) / n_cond,
+                    fluid_res=(total_fluid_res - step_fluid_res_prev) / n_cond,
+                    fluid_inlet=(total_fluid_inlet - step_fluid_inlet_prev) / n_cond,
+                    interface=(total_interface - step_interface_prev) / n_cond,
                 )
                 step_loss_prev = epoch_loss
                 step_data_prev = total_data
                 step_res_prev = total_res
                 step_bc_prev = total_bc
+                step_cold_bc_prev = total_cold_bc
                 step_ic_prev = total_ic
+                step_fluid_res_prev = total_fluid_res
+                step_fluid_inlet_prev = total_fluid_inlet
+                step_interface_prev = total_interface
 
             num_steps_total = steps_per_epoch * num_conditions
             avg_total = epoch_loss / num_steps_total
@@ -1244,6 +1267,7 @@ class PINNTrainer:
 
             if epoch % self.cfg.optim.plot_every == 0:
                 self.visualizer.plot_loss(epoch)
+                self.visualizer.plot_loss_by_step()
 
         self.writer.close()
         print(f"Training done. Best model: epoch {best_epoch} (loss={best_loss:.4e})")
@@ -1260,6 +1284,7 @@ class PINNTrainer:
     def evaluate(self):
         print("Starting final evaluation...")
         self.visualizer.plot_loss(self.cfg.optim.epochs)
+        self.visualizer.plot_loss_by_step()
 
     def evaluate_on_test(self):
         """Evaluate model on independent test CSVs configured per condition."""
@@ -1345,7 +1370,7 @@ class PINNTrainer:
 
             # Save predictions and original data
             pred_df = pd.DataFrame(all_rows)
-            pred_csv_path = save_dir / f"predictions_{cond.name}_{self.config_name}.csv"
+            pred_csv_path = save_dir / f"predictions_{cond.name}.csv"
             pred_df.to_csv(pred_csv_path, index=False)
             print(f"  - Saved predictions to {pred_csv_path}")
 
@@ -1373,7 +1398,7 @@ class PINNTrainer:
                     else:
                         break
             if point_coords:
-                pred_plot_path = save_dir / f"pred_vs_true_{cond.name}_{self.config_name}.png"
+                pred_plot_path = save_dir / f"pred_vs_true_{cond.name}.png"
                 self.visualizer.plot_prediction_vs_true(
                     pred_df,
                     point_coords[:3],
@@ -1391,6 +1416,8 @@ class PINNTrainer:
                 cond,
                 self.cfg.physics.t_max,
                 self.cfg.physics.init_temp,
+                temperature_max = max(ds_test.y),
+                temperature_min = min(ds_test.y),
                 x_positions_mm=x_positions_mm,
                 time_points=time_points,
                 normalize_fn=self._normalize,
